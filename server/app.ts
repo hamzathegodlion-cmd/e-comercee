@@ -9,17 +9,19 @@ import {
   verifyPassword,
   createSessionToken,
   verifySessionToken,
-} from './db.ts';
+} from './db.js';
+
+interface AuthUser {
+  id: number;
+  name: string;
+  username: string;
+  email: string;
+  role: 'customer' | 'manager';
+  createdAt: string;
+}
 
 interface AuthRequest extends Request {
-  authUser?: {
-    id: number;
-    name: string;
-    username: string;
-    email: string;
-    role: 'customer' | 'manager';
-    createdAt: string;
-  };
+  authUser?: AuthUser;
 }
 
 function parseCookies(cookieHeader: string | undefined): Record<string, string> {
@@ -29,8 +31,12 @@ function parseCookies(cookieHeader: string | undefined): Record<string, string> 
     const idx = part.indexOf('=');
     if (idx > -1) {
       const k = part.slice(0, idx).trim();
-      const v = decodeURIComponent(part.slice(idx + 1).trim());
-      out[k] = v;
+      const rawVal = part.slice(idx + 1).trim();
+      try {
+        out[k] = decodeURIComponent(rawVal);
+      } catch {
+        out[k] = rawVal;
+      }
     }
   }
   return out;
@@ -45,16 +51,65 @@ function extractToken(req: Request): string | undefined {
   return cookies['aeterna_session'];
 }
 
+function slugifyCategory(name: string): string {
+  const slug = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, '-')
+    .replace(/(^-|-$)/g, '');
+  return slug || `dept-${Date.now().toString(36)}`;
+}
+
 function attachUser(req: AuthRequest, _res: Response, next: NextFunction) {
-  const token = extractToken(req);
-  const payload = verifySessionToken(token);
-  if (payload) {
-    const row = db
-      .prepare('SELECT id, name, username, email, role, created_at as createdAt FROM users WHERE id = ?')
-      .get(payload.userId) as AuthRequest['authUser'] | undefined;
-    if (row) {
-      req.authUser = row;
+  try {
+    const token = extractToken(req);
+    const payload = verifySessionToken(token);
+    if (payload) {
+      let row: AuthUser | undefined;
+      if (payload.username) {
+        row = db
+          .prepare(
+            'SELECT id, name, username, email, role, created_at as createdAt FROM users WHERE lower(username) = lower(?)'
+          )
+          .get(payload.username) as AuthUser | undefined;
+      } else {
+        row = db
+          .prepare(
+            'SELECT id, name, username, email, role, created_at as createdAt FROM users WHERE id = ?'
+          )
+          .get(payload.userId) as AuthUser | undefined;
+      }
+
+      if (!row && payload.role === 'customer' && payload.username && payload.email) {
+        db.prepare(
+          `INSERT OR IGNORE INTO users (name, username, email, password_hash, role)
+           VALUES (?, ?, ?, ?, 'customer')`
+        ).run(
+          payload.name || payload.username,
+          payload.username.toLowerCase(),
+          payload.email.toLowerCase(),
+          hashPassword(`session_sync_${payload.username}`)
+        );
+        row = db
+          .prepare(
+            'SELECT id, name, username, email, role, created_at as createdAt FROM users WHERE lower(username) = lower(?)'
+          )
+          .get(payload.username) as AuthUser | undefined;
+      }
+
+      if (row && row.role === payload.role) {
+        req.authUser = {
+          id: Number(row.id),
+          name: String(row.name),
+          username: String(row.username),
+          email: String(row.email),
+          role: row.role,
+          createdAt: String(row.createdAt),
+        };
+      }
     }
+  } catch {
+    // ignore invalid session state and treat as unauthenticated
   }
   next();
 }
@@ -133,7 +188,7 @@ function getOrdersWithItems(whereClause = '', params: unknown[] = []) {
        FROM orders ${whereClause}
        ORDER BY datetime(created_at) DESC, id DESC`
     )
-    .all(...params) as Array<Record<string, unknown>>;
+    .all(...params);
 
   const itemStmt = db.prepare(
     `SELECT id, order_id as orderId, product_id as productId, product_name as productName,
@@ -144,8 +199,34 @@ function getOrdersWithItems(whereClause = '', params: unknown[] = []) {
 
   return orders.map((o) => ({
     ...o,
-    items: itemStmt.all(o.id),
+    id: Number(o.id),
+    userId: o.userId !== null && o.userId !== undefined ? Number(o.userId) : null,
+    subtotal: Number(o.subtotal),
+    shippingFee: Number(o.shippingFee),
+    totalAmount: Number(o.totalAmount),
+    totalProfit: Number(o.totalProfit),
+    items: itemStmt.all(o.id).map((it) => ({
+      ...it,
+      id: Number(it.id),
+      orderId: Number(it.orderId),
+      productId: Number(it.productId),
+      unitPrice: Number(it.unitPrice),
+      unitCost: Number(it.unitCost),
+      quantity: Number(it.quantity),
+      lineTotal: Number(it.lineTotal),
+    })),
   }));
+}
+
+function generateUniqueOrderNumber(): string {
+  const checkStmt = db.prepare('SELECT 1 FROM orders WHERE order_number = ?');
+  for (let attempt = 0; attempt < 25; attempt++) {
+    const candidate = `ORD-${1050 + Math.floor(Math.random() * 8900)}`;
+    if (!checkStmt.get(candidate)) {
+      return candidate;
+    }
+  }
+  return `ORD-${Date.now().toString().slice(-6)}`;
 }
 
 export function createApiApp() {
@@ -154,15 +235,17 @@ export function createApiApp() {
   const app = express();
   app.set('trust proxy', 1);
 
-  // Support both same-origin and cross-origin (Vercel frontend -> Cloud Run backend)
+  // Support both same-origin and cross-origin (Vercel frontend -> Cloud Run / API backend)
   const allowedOrigins = (process.env.ALLOWED_ORIGIN || '')
     .split(',')
-    .map((o) => o.trim())
+    .map((o) => o.trim().replace(/\/+$/, ''))
     .filter(Boolean);
 
   app.use((req, res, next) => {
     const origin = req.headers.origin;
-    if (origin && (allowedOrigins.length === 0 || allowedOrigins.includes(origin))) {
+    const normalizedOrigin = origin ? origin.replace(/\/+$/, '') : '';
+    const allowAny = allowedOrigins.length === 0 || allowedOrigins.includes('*');
+    if (origin && (allowAny || allowedOrigins.includes(normalizedOrigin))) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Vary', 'Origin');
       res.setHeader('Access-Control-Allow-Credentials', 'true');
@@ -172,6 +255,40 @@ export function createApiApp() {
     if (req.method === 'OPTIONS') {
       res.sendStatus(204);
       return;
+    }
+    next();
+  });
+
+  // Compatibility with serverless runtimes (e.g. Vercel) that pre-parse req.body
+  app.use((req, _res, next) => {
+    const r = req as Request & { _body?: boolean; body?: unknown };
+    if (r.body !== undefined && !r._body) {
+      if (Buffer.isBuffer(r.body)) {
+        const text = r.body.toString('utf8');
+        if (text.trim()) {
+          try {
+            r.body = JSON.parse(text);
+          } catch {
+            // keep buffer if not JSON
+          }
+        } else {
+          r.body = {};
+        }
+        r._body = true;
+      } else if (typeof r.body === 'string') {
+        if (r.body.trim()) {
+          try {
+            r.body = JSON.parse(r.body);
+          } catch {
+            // keep string if not JSON
+          }
+        } else {
+          r.body = {};
+        }
+        r._body = true;
+      } else if (typeof r.body === 'object' && r.body !== null) {
+        r._body = true;
+      }
     }
     next();
   });
@@ -190,8 +307,20 @@ export function createApiApp() {
     app.use('/assets/images', express.static(imagesDir));
   }
 
+  app.get('/api', (_req: Request, res: Response) => {
+    res.json({ ok: true, service: 'Aeterna Commerce API', engine: db.engine });
+  });
+
   app.get('/api/health', (_req: Request, res: Response) => {
-    res.json({ ok: true, db: 'sqlite', timestamp: new Date().toISOString() });
+    const countRow = db.prepare('SELECT COUNT(*) as c FROM products').get() as
+      | { c: number }
+      | undefined;
+    res.json({
+      ok: true,
+      db: db.engine,
+      products: Number(countRow?.c ?? 0),
+      timestamp: new Date().toISOString(),
+    });
   });
 
   // ==================== AUTH ROUTES ====================
@@ -227,11 +356,22 @@ export function createApiApp() {
       )
       .run(String(name).trim(), cleanUsername, cleanEmail, hashPassword(String(password)));
 
-    const user = db
-      .prepare('SELECT id, name, username, email, role, created_at as createdAt FROM users WHERE id = ?')
-      .get(info.lastInsertRowid) as NonNullable<AuthRequest['authUser']>;
+    const userRow = db
+      .prepare(
+        'SELECT id, name, username, email, role, created_at as createdAt FROM users WHERE id = ?'
+      )
+      .get(info.lastInsertRowid) as unknown as AuthUser;
 
-    const token = createSessionToken(user.id, user.role);
+    const user: AuthUser = {
+      id: Number(userRow.id),
+      name: String(userRow.name),
+      username: String(userRow.username),
+      email: String(userRow.email),
+      role: userRow.role,
+      createdAt: String(userRow.createdAt),
+    };
+
+    const token = createSessionToken(user);
     const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
     res.cookie('aeterna_session', token, {
       httpOnly: true,
@@ -257,9 +397,7 @@ export function createApiApp() {
         `SELECT id, name, username, email, password_hash, role, created_at as createdAt
          FROM users WHERE lower(username) = ? OR lower(email) = ?`
       )
-      .get(lookup, lookup) as
-      | (NonNullable<AuthRequest['authUser']> & { password_hash: string })
-      | undefined;
+      .get(lookup, lookup) as (AuthUser & { password_hash: string }) | undefined;
 
     const rawPassword = String(password);
     const trimmedPassword = rawPassword.trim();
@@ -283,8 +421,16 @@ export function createApiApp() {
       return;
     }
 
-    const token = createSessionToken(userRow.id, userRow.role);
-    const { password_hash: _ignored, ...safeUser } = userRow;
+    const safeUser: AuthUser = {
+      id: Number(userRow.id),
+      name: String(userRow.name),
+      username: String(userRow.username),
+      email: String(userRow.email),
+      role: userRow.role,
+      createdAt: String(userRow.createdAt),
+    };
+
+    const token = createSessionToken(safeUser);
     const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
 
     res.cookie('aeterna_session', token, {
@@ -323,7 +469,12 @@ export function createApiApp() {
     }
     const row = db
       .prepare('SELECT id, password_hash FROM users WHERE id = ?')
-      .get(req.authUser!.id) as { id: number; password_hash: string };
+      .get(req.authUser!.id) as { id: number; password_hash: string } | undefined;
+
+    if (!row) {
+      res.status(404).json({ error: 'Manager account not found.' });
+      return;
+    }
 
     const rawCurrent = String(currentPassword);
     const currentMatches =
@@ -344,7 +495,7 @@ export function createApiApp() {
 
   // ==================== PUBLIC STOREFRONT ====================
   app.get('/api/storefront', (_req: Request, res: Response) => {
-    const settingsRow = db.prepare('SELECT * FROM settings WHERE id = 1').get() as Record<string, unknown>;
+    const settingsRow = db.prepare('SELECT * FROM settings WHERE id = 1').get()!;
     const categories = db
       .prepare(
         `SELECT c.id, c.name, c.slug, c.description, c.is_open as isOpen, c.created_at as createdAt,
@@ -356,14 +507,12 @@ export function createApiApp() {
          ORDER BY c.id ASC`
       )
       .all()
-      .map((c: unknown) => {
-        const row = c as Record<string, unknown>;
-        return {
-          ...row,
-          isOpen: Boolean(row.isOpen),
-          productCount: Number(row.productCount),
-        };
-      });
+      .map((row) => ({
+        ...row,
+        id: Number(row.id),
+        isOpen: Boolean(row.isOpen),
+        productCount: Number(row.productCount),
+      }));
 
     const products = db
       .prepare(
@@ -374,7 +523,7 @@ export function createApiApp() {
          ORDER BY p.featured DESC, p.id DESC`
       )
       .all()
-      .map((r) => mapProductRow(r as Record<string, unknown>));
+      .map((r) => mapProductRow(r));
 
     res.json({
       settings: mapSettingsRow(settingsRow),
@@ -416,13 +565,18 @@ export function createApiApp() {
          WHERE ${conditions.join(' AND ')}
          ORDER BY ${orderBy}`
       )
-      .all(...params) as Array<Record<string, unknown>>;
+      .all(...params);
 
     res.json({ products: rows.map(mapProductRow) });
   });
 
   app.get('/api/products/:id', (req: AuthRequest, res: Response) => {
     const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      res.status(404).json({ error: 'Product not found.' });
+      return;
+    }
+
     const row = db
       .prepare(
         `SELECT p.*, c.name as category_name, c.slug as category_slug, c.is_open as category_open
@@ -430,7 +584,7 @@ export function createApiApp() {
          JOIN categories c ON c.id = p.category_id
          WHERE p.id = ? AND p.is_active = 1 AND c.is_open = 1`
       )
-      .get(id) as Record<string, unknown> | undefined;
+      .get(id);
 
     if (!row) {
       res.status(404).json({ error: 'Product not found.' });
@@ -451,13 +605,19 @@ export function createApiApp() {
 
   app.post('/api/products/:id/favorite', (req: Request, res: Response) => {
     const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      res.status(404).json({ error: 'Product not found.' });
+      return;
+    }
     const info = db.prepare('UPDATE products SET favorites = favorites + 1 WHERE id = ?').run(id);
     if (info.changes === 0) {
       res.status(404).json({ error: 'Product not found.' });
       return;
     }
-    const updated = db.prepare('SELECT favorites FROM products WHERE id = ?').get(id) as { favorites: number };
-    res.json({ favorites: updated.favorites });
+    const updated = db.prepare('SELECT favorites FROM products WHERE id = ?').get(id) as {
+      favorites: number;
+    };
+    res.json({ favorites: Number(updated.favorites) });
   });
 
   // ==================== CUSTOMER HISTORY & ORDERS ====================
@@ -472,7 +632,7 @@ export function createApiApp() {
          ORDER BY datetime(bh.viewed_at) DESC
          LIMIT 12`
       )
-      .all(req.authUser!.id) as Array<Record<string, unknown>>;
+      .all(req.authUser!.id);
 
     const history = rows.map((r) => ({
       id: Number(r.hist_id),
@@ -484,16 +644,21 @@ export function createApiApp() {
   });
 
   app.post('/api/history', requireAuth, (req: AuthRequest, res: Response) => {
-    const { productId } = req.body ?? {};
-    if (!productId) {
-      res.status(400).json({ error: 'productId is required.' });
+    const pid = Number(req.body?.productId);
+    if (!Number.isInteger(pid) || pid <= 0) {
+      res.status(400).json({ error: 'Valid productId is required.' });
+      return;
+    }
+    const prodExists = db.prepare('SELECT id FROM products WHERE id = ?').get(pid);
+    if (!prodExists) {
+      res.status(404).json({ error: 'Product not found.' });
       return;
     }
     db.prepare(
       `INSERT INTO browsing_history (user_id, product_id, viewed_at)
        VALUES (?, ?, datetime('now'))
        ON CONFLICT(user_id, product_id) DO UPDATE SET viewed_at = datetime('now')`
-    ).run(req.authUser!.id, Number(productId));
+    ).run(req.authUser!.id, pid);
     res.json({ ok: true });
   });
 
@@ -555,7 +720,7 @@ export function createApiApp() {
         for (const reqItem of items) {
           const pid = Number(reqItem.productId);
           const qty = Math.floor(Number(reqItem.quantity));
-          if (!pid || qty <= 0) {
+          if (!Number.isInteger(pid) || pid <= 0 || qty <= 0) {
             throw new Error('Invalid cart item quantity.');
           }
           const prod = db
@@ -565,10 +730,10 @@ export function createApiApp() {
                JOIN categories c ON c.id = p.category_id
                WHERE p.id = ?`
             )
-            .get(pid) as Record<string, unknown> | undefined;
+            .get(pid);
 
           if (!prod || !prod.is_active || !prod.category_open) {
-            throw new Error(`One of the items in your bag is no longer available.`);
+            throw new Error('One of the items in your bag is no longer available.');
           }
           const currentStock = Number(prod.stock);
           if (currentStock < qty) {
@@ -594,9 +759,9 @@ export function createApiApp() {
           });
         }
 
-        const shippingFee = subtotal >= settingsRow.free_shipping_threshold ? 0 : 12;
+        const shippingFee = subtotal >= Number(settingsRow.free_shipping_threshold) ? 0 : 12;
         const totalAmount = subtotal + shippingFee;
-        const orderNumber = `ORD-${1050 + Math.floor(Math.random() * 8900)}`;
+        const orderNumber = generateUniqueOrderNumber();
 
         const info = db
           .prepare(
@@ -712,7 +877,7 @@ export function createApiApp() {
          WHERE p.stock <= ?
          ORDER BY p.stock ASC, p.id ASC`
       )
-      .all(settings.low_stock_threshold) as Array<Record<string, unknown>>;
+      .all(Number(settings.low_stock_threshold));
 
     const series = db
       .prepare(
@@ -725,7 +890,13 @@ export function createApiApp() {
          GROUP BY label
          ORDER BY label ASC`
       )
-      .all();
+      .all()
+      .map((s) => ({
+        label: String(s.label),
+        orders: Number(s.orders),
+        revenue: Number(s.revenue),
+        income: Number(s.income),
+      }));
 
     const bestProducts = db
       .prepare(
@@ -780,13 +951,15 @@ export function createApiApp() {
       )
       .all();
 
-    const avgOrderValue = kpiRow.ordersCount > 0 ? kpiRow.revenue / kpiRow.ordersCount : 0;
+    const ordersCount = Number(kpiRow.ordersCount);
+    const revenue = Number(kpiRow.revenue);
+    const avgOrderValue = ordersCount > 0 ? revenue / ordersCount : 0;
 
     res.json({
       period,
       kpis: {
-        ordersCount: Number(kpiRow.ordersCount),
-        revenue: Number(kpiRow.revenue),
+        ordersCount,
+        revenue,
         income: Number(kpiRow.income),
         avgOrderValue: Number(avgOrderValue.toFixed(2)),
         unitsSold: Number(unitsRow.unitsSold),
@@ -809,7 +982,7 @@ export function createApiApp() {
          JOIN categories c ON c.id = p.category_id
          ORDER BY p.id DESC`
       )
-      .all() as Array<Record<string, unknown>>;
+      .all();
     res.json({ products: rows.map(mapProductRow) });
   });
 
@@ -853,7 +1026,7 @@ export function createApiApp() {
           `SELECT p.*, c.name as category_name, c.slug as category_slug, c.is_open as category_open
            FROM products p JOIN categories c ON c.id = p.category_id WHERE p.id = ?`
         )
-        .get(info.lastInsertRowid) as Record<string, unknown>;
+        .get(info.lastInsertRowid)!;
 
       res.status(201).json({ product: mapProductRow(created) });
     } catch (err) {
@@ -864,42 +1037,47 @@ export function createApiApp() {
 
   app.put('/api/manager/products/:id', requireManager, (req: Request, res: Response) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT * FROM products WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    const existing = db.prepare('SELECT * FROM products WHERE id = ?').get(id);
     if (!existing) {
       res.status(404).json({ error: 'Product not found.' });
       return;
     }
 
     const b = req.body ?? {};
-    db.prepare(
-      `UPDATE products SET
-         name = ?, sku = ?, category_id = ?, description = ?,
-         price = ?, cost_price = ?, stock = ?, image_url = ?,
-         featured = ?, is_active = ?, specs_json = ?
-       WHERE id = ?`
-    ).run(
-      b.name !== undefined ? String(b.name).trim() : existing.name,
-      b.sku !== undefined ? String(b.sku).trim().toUpperCase() : existing.sku,
-      b.categoryId !== undefined ? Number(b.categoryId) : existing.category_id,
-      b.description !== undefined ? String(b.description) : existing.description,
-      b.price !== undefined ? Number(b.price) : existing.price,
-      b.costPrice !== undefined ? Number(b.costPrice) : existing.cost_price,
-      b.stock !== undefined ? Math.max(0, Math.floor(Number(b.stock))) : existing.stock,
-      b.imageUrl !== undefined ? String(b.imageUrl) : existing.image_url,
-      b.featured !== undefined ? (b.featured ? 1 : 0) : existing.featured,
-      b.isActive !== undefined ? (b.isActive ? 1 : 0) : existing.is_active,
-      b.specs !== undefined ? JSON.stringify(b.specs) : existing.specs_json,
-      id
-    );
+    try {
+      db.prepare(
+        `UPDATE products SET
+           name = ?, sku = ?, category_id = ?, description = ?,
+           price = ?, cost_price = ?, stock = ?, image_url = ?,
+           featured = ?, is_active = ?, specs_json = ?
+         WHERE id = ?`
+      ).run(
+        b.name !== undefined ? String(b.name).trim() : existing.name,
+        b.sku !== undefined ? String(b.sku).trim().toUpperCase() : existing.sku,
+        b.categoryId !== undefined ? Number(b.categoryId) : existing.category_id,
+        b.description !== undefined ? String(b.description) : existing.description,
+        b.price !== undefined ? Number(b.price) : existing.price,
+        b.costPrice !== undefined ? Number(b.costPrice) : existing.cost_price,
+        b.stock !== undefined ? Math.max(0, Math.floor(Number(b.stock))) : existing.stock,
+        b.imageUrl !== undefined ? String(b.imageUrl) : existing.image_url,
+        b.featured !== undefined ? (b.featured ? 1 : 0) : existing.featured,
+        b.isActive !== undefined ? (b.isActive ? 1 : 0) : existing.is_active,
+        b.specs !== undefined ? JSON.stringify(b.specs) : existing.specs_json,
+        id
+      );
 
-    const updated = db
-      .prepare(
-        `SELECT p.*, c.name as category_name, c.slug as category_slug, c.is_open as category_open
-         FROM products p JOIN categories c ON c.id = p.category_id WHERE p.id = ?`
-      )
-      .get(id) as Record<string, unknown>;
+      const updated = db
+        .prepare(
+          `SELECT p.*, c.name as category_name, c.slug as category_slug, c.is_open as category_open
+           FROM products p JOIN categories c ON c.id = p.category_id WHERE p.id = ?`
+        )
+        .get(id)!;
 
-    res.json({ product: mapProductRow(updated) });
+      res.json({ product: mapProductRow(updated) });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unable to update product.';
+      res.status(400).json({ error: msg.includes('UNIQUE') ? 'SKU already exists.' : msg });
+    }
   });
 
   app.delete('/api/manager/products/:id', requireManager, (req: Request, res: Response) => {
@@ -925,10 +1103,12 @@ export function createApiApp() {
          ORDER BY c.id ASC`
       )
       .all()
-      .map((c: unknown) => {
-        const r = c as Record<string, unknown>;
-        return { ...r, isOpen: Boolean(r.isOpen), productCount: Number(r.productCount) };
-      });
+      .map((r) => ({
+        ...r,
+        id: Number(r.id),
+        isOpen: Boolean(r.isOpen),
+        productCount: Number(r.productCount),
+      }));
     res.json({ categories: rows });
   });
 
@@ -939,10 +1119,7 @@ export function createApiApp() {
       return;
     }
     const cleanName = String(name).trim();
-    const slug = cleanName
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/(^-|-$)/g, '');
+    const slug = slugifyCategory(cleanName);
 
     try {
       const info = db
@@ -950,9 +1127,18 @@ export function createApiApp() {
         .run(cleanName, slug, String(description || ''), isOpen === false ? 0 : 1);
 
       const created = db
-        .prepare('SELECT id, name, slug, description, is_open as isOpen, created_at as createdAt FROM categories WHERE id = ?')
-        .get(info.lastInsertRowid) as Record<string, unknown>;
-      res.status(201).json({ category: { ...created, isOpen: Boolean(created.isOpen), productCount: 0 } });
+        .prepare(
+          'SELECT id, name, slug, description, is_open as isOpen, created_at as createdAt FROM categories WHERE id = ?'
+        )
+        .get(info.lastInsertRowid)!;
+      res.status(201).json({
+        category: {
+          ...created,
+          id: Number(created.id),
+          isOpen: Boolean(created.isOpen),
+          productCount: 0,
+        },
+      });
     } catch {
       res.status(409).json({ error: 'Category already exists.' });
     }
@@ -960,37 +1146,48 @@ export function createApiApp() {
 
   app.put('/api/manager/categories/:id', requireManager, (req: Request, res: Response) => {
     const id = Number(req.params.id);
-    const existing = db.prepare('SELECT * FROM categories WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    const existing = db.prepare('SELECT * FROM categories WHERE id = ?').get(id);
     if (!existing) {
       res.status(404).json({ error: 'Category not found.' });
       return;
     }
     const b = req.body ?? {};
     const nextName = b.name !== undefined ? String(b.name).trim() : String(existing.name);
-    const nextSlug = nextName
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/(^-|-$)/g, '');
+    if (!nextName) {
+      res.status(400).json({ error: 'Category name cannot be empty.' });
+      return;
+    }
+    const nextSlug = slugifyCategory(nextName);
 
-    db.prepare('UPDATE categories SET name = ?, slug = ?, description = ?, is_open = ? WHERE id = ?').run(
-      nextName,
-      nextSlug,
-      b.description !== undefined ? String(b.description) : existing.description,
-      b.isOpen !== undefined ? (b.isOpen ? 1 : 0) : existing.is_open,
-      id
-    );
+    try {
+      db.prepare('UPDATE categories SET name = ?, slug = ?, description = ?, is_open = ? WHERE id = ?').run(
+        nextName,
+        nextSlug,
+        b.description !== undefined ? String(b.description) : existing.description,
+        b.isOpen !== undefined ? (b.isOpen ? 1 : 0) : existing.is_open,
+        id
+      );
 
-    const updated = db
-      .prepare('SELECT id, name, slug, description, is_open as isOpen, created_at as createdAt FROM categories WHERE id = ?')
-      .get(id) as Record<string, unknown>;
-    res.json({ category: { ...updated, isOpen: Boolean(updated.isOpen) } });
+      const updated = db
+        .prepare(
+          'SELECT id, name, slug, description, is_open as isOpen, created_at as createdAt FROM categories WHERE id = ?'
+        )
+        .get(id)!;
+      res.json({
+        category: { ...updated, id: Number(updated.id), isOpen: Boolean(updated.isOpen) },
+      });
+    } catch {
+      res.status(409).json({ error: 'Another category with that name already exists.' });
+    }
   });
 
   app.delete('/api/manager/categories/:id', requireManager, (req: Request, res: Response) => {
     const id = Number(req.params.id);
     const hasProd = db.prepare('SELECT id FROM products WHERE category_id = ? LIMIT 1').get(id);
     if (hasProd) {
-      res.status(400).json({ error: 'Cannot delete category with existing products. Close it or reassign products first.' });
+      res.status(400).json({
+        error: 'Cannot delete category with existing products. Close it or reassign products first.',
+      });
       return;
     }
     db.prepare('DELETE FROM categories WHERE id = ?').run(id);
@@ -1003,22 +1200,49 @@ export function createApiApp() {
 
   app.put('/api/manager/orders/:id/status', requireManager, (req: Request, res: Response) => {
     const id = Number(req.params.id);
-    const { status } = req.body ?? {};
+    const nextStatus = String(req.body?.status || '');
     const valid = ['Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled'];
-    if (!valid.includes(String(status))) {
+    if (!valid.includes(nextStatus)) {
       res.status(400).json({ error: 'Invalid order status.' });
       return;
     }
-    const info = db.prepare('UPDATE orders SET status = ? WHERE id = ?').run(String(status), id);
-    if (info.changes === 0) {
+
+    const existing = db.prepare('SELECT id, status FROM orders WHERE id = ?').get(id) as
+      | { id: number; status: string }
+      | undefined;
+    if (!existing) {
       res.status(404).json({ error: 'Order not found.' });
       return;
     }
+
+    db.transaction(() => {
+      if (existing.status !== 'Cancelled' && nextStatus === 'Cancelled') {
+        const items = db
+          .prepare('SELECT product_id, quantity FROM order_items WHERE order_id = ?')
+          .all(id) as Array<{ product_id: number; quantity: number }>;
+        const restoreStmt = db.prepare('UPDATE products SET stock = stock + ? WHERE id = ?');
+        for (const item of items) {
+          restoreStmt.run(Number(item.quantity), Number(item.product_id));
+        }
+      } else if (existing.status === 'Cancelled' && nextStatus !== 'Cancelled') {
+        const items = db
+          .prepare('SELECT product_id, quantity FROM order_items WHERE order_id = ?')
+          .all(id) as Array<{ product_id: number; quantity: number }>;
+        const deductStmt = db.prepare(
+          'UPDATE products SET stock = MAX(0, stock - ?) WHERE id = ?'
+        );
+        for (const item of items) {
+          deductStmt.run(Number(item.quantity), Number(item.product_id));
+        }
+      }
+      db.prepare('UPDATE orders SET status = ? WHERE id = ?').run(nextStatus, id);
+    })();
+
     res.json({ order: getOrdersWithItems('WHERE id = ?', [id])[0] });
   });
 
   app.put('/api/manager/settings', requireManager, (req: Request, res: Response) => {
-    const current = db.prepare('SELECT * FROM settings WHERE id = 1').get() as Record<string, unknown>;
+    const current = db.prepare('SELECT * FROM settings WHERE id = 1').get()!;
     const b = req.body ?? {};
     db.prepare(
       `UPDATE settings SET
@@ -1033,14 +1257,29 @@ export function createApiApp() {
       b.heroTitle !== undefined ? String(b.heroTitle) : current.hero_title,
       b.heroSubtitle !== undefined ? String(b.heroSubtitle) : current.hero_subtitle,
       b.heroImageUrl !== undefined ? String(b.heroImageUrl) : current.hero_image_url,
-      b.lowStockThreshold !== undefined ? Math.max(1, Number(b.lowStockThreshold)) : current.low_stock_threshold,
+      b.lowStockThreshold !== undefined
+        ? Math.max(1, Number(b.lowStockThreshold))
+        : current.low_stock_threshold,
       b.freeShippingThreshold !== undefined
         ? Math.max(0, Number(b.freeShippingThreshold))
         : current.free_shipping_threshold
     );
 
-    const updated = db.prepare('SELECT * FROM settings WHERE id = 1').get() as Record<string, unknown>;
+    const updated = db.prepare('SELECT * FROM settings WHERE id = 1').get()!;
     res.json({ settings: mapSettingsRow(updated) });
+  });
+
+  // Catch-all JSON 404 for unknown /api/* routes
+  app.all('/api/*', (_req: Request, res: Response) => {
+    res.status(404).json({ error: 'API endpoint not found.' });
+  });
+
+  // Express JSON error handler
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    console.error('[API Error]', err);
+    if (res.headersSent) return;
+    const message = err instanceof Error ? err.message : 'Internal server error.';
+    res.status(500).json({ error: message });
   });
 
   return app;

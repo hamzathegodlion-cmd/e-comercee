@@ -1,10 +1,13 @@
+import 'dotenv/config';
 import express from 'express';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
-import { createApiApp } from './server/app.ts';
+import { createApiApp } from './server/app.js';
 
 async function startServer() {
   const app = createApiApp();
+  const httpServer = http.createServer(app);
   const isProduction =
     process.env.NODE_ENV === 'production' || process.env.npm_lifecycle_event === 'start';
 
@@ -12,7 +15,11 @@ async function startServer() {
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: true,
+        hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -21,7 +28,11 @@ async function startServer() {
     const indexHtml = path.join(distDir, 'index.html');
     if (fs.existsSync(indexHtml)) {
       app.use(express.static(distDir));
-      app.get('*', (_req, res) => {
+      app.get('*', (req, res) => {
+        if (req.path.startsWith('/api/')) {
+          res.status(404).json({ error: 'API endpoint not found.' });
+          return;
+        }
         res.sendFile(indexHtml);
       });
     } else {
@@ -32,7 +43,7 @@ async function startServer() {
   }
 
   const PORT = Number(process.env.PORT || 3000);
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on http://0.0.0.0:${PORT}`);
   });
 }

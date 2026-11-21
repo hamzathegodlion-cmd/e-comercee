@@ -1,43 +1,286 @@
-import Database from 'better-sqlite3';
+import 'dotenv/config';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 
-function resolveDataDir(): string {
-  const localDir = path.resolve(process.cwd(), 'data');
-  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
-    const tmpDir = path.join(os.tmpdir(), 'aeterna-data');
-    if (!fs.existsSync(tmpDir)) {
-      fs.mkdirSync(tmpDir, { recursive: true });
-    }
-    return tmpDir;
-  }
-  try {
-    if (!fs.existsSync(localDir)) {
-      fs.mkdirSync(localDir, { recursive: true });
-    }
-    fs.accessSync(localDir, fs.constants.W_OK);
-    return localDir;
-  } catch {
-    const tmpDir = path.join(os.tmpdir(), 'aeterna-data');
-    if (!fs.existsSync(tmpDir)) {
-      fs.mkdirSync(tmpDir, { recursive: true });
-    }
-    return tmpDir;
-  }
+const require = createRequire(import.meta.url);
+
+export interface RunResult {
+  changes: number;
+  lastInsertRowid: number;
 }
 
-const DATA_DIR = resolveDataDir();
-const DB_PATH = path.join(DATA_DIR, 'store.db');
-export const db = new Database(DB_PATH);
+export interface PreparedStatement {
+  get: <T = Record<string, unknown>>(...params: unknown[]) => T | undefined;
+  all: <T = Record<string, unknown>>(...params: unknown[]) => T[];
+  run: (...params: unknown[]) => RunResult;
+}
 
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+export interface DbAdapter {
+  engine: 'better-sqlite3' | 'node:sqlite' | 'bun:sqlite';
+  dbPath: string;
+  exec: (sql: string) => void;
+  prepare: (sql: string) => PreparedStatement;
+  transaction: <T>(fn: () => T) => () => T;
+}
 
-const SESSION_SECRET =
-  process.env.SESSION_SECRET ||
-  crypto.createHash('sha256').update(process.cwd() + '_aeterna_secret_key').digest('hex');
+const IS_SERVERLESS = Boolean(
+  process.env.VERCEL ||
+    process.env.VERCEL_ENV ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.LAMBDA_TASK_ROOT
+);
+
+function normalizeParams(params: unknown[]): Array<string | number | bigint | Uint8Array | null> {
+  return params.map((p) => {
+    if (p === undefined || p === null) return null;
+    if (typeof p === 'boolean') return p ? 1 : 0;
+    if (
+      typeof p === 'string' ||
+      typeof p === 'number' ||
+      typeof p === 'bigint' ||
+      p instanceof Uint8Array
+    ) {
+      return p;
+    }
+    return String(p);
+  });
+}
+
+function normalizeRow(row: unknown): Record<string, unknown> | undefined {
+  if (!row || typeof row !== 'object') return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(row as Record<string, unknown>)) {
+    out[k] = typeof v === 'bigint' ? Number(v) : v;
+  }
+  return out;
+}
+
+function getCandidateDbPaths(): string[] {
+  const candidates: string[] = [];
+  if (process.env.DATA_DIR) {
+    candidates.push(path.join(path.resolve(process.env.DATA_DIR), 'store.db'));
+  }
+  if (!IS_SERVERLESS) {
+    candidates.push(path.join(path.resolve(process.cwd(), 'data'), 'store.db'));
+  }
+  candidates.push(path.join(os.tmpdir(), 'aeterna-data', 'store.db'));
+  candidates.push(':memory:');
+  return candidates;
+}
+
+function ensureParentDir(dbFile: string) {
+  if (dbFile === ':memory:') return;
+  const dir = path.dirname(dbFile);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  fs.accessSync(dir, fs.constants.W_OK);
+}
+
+function tryBetterSqlite3(dbFile: string): DbAdapter {
+  if (process.env.FORCE_NODE_SQLITE === '1') {
+    throw new Error('Forced node:sqlite mode');
+  }
+  const BetterSqlite3 = require('better-sqlite3') as new (filename: string) => {
+    exec: (sql: string) => void;
+    prepare: (sql: string) => {
+      get: (...args: unknown[]) => unknown;
+      all: (...args: unknown[]) => unknown[];
+      run: (...args: unknown[]) => { changes: number | bigint; lastInsertRowid: number | bigint };
+    };
+    transaction: <T>(fn: () => T) => () => T;
+  };
+
+  const rawDb = new BetterSqlite3(dbFile);
+  rawDb.prepare('SELECT 1').get();
+
+  return {
+    engine: 'better-sqlite3',
+    dbPath: dbFile,
+    exec: (sql: string) => rawDb.exec(sql),
+    prepare: (sql: string) => {
+      const stmt = rawDb.prepare(sql);
+      return {
+        get: <T = Record<string, unknown>>(...params: unknown[]) =>
+          normalizeRow(stmt.get(...normalizeParams(params))) as T | undefined,
+        all: <T = Record<string, unknown>>(...params: unknown[]) =>
+          stmt
+            .all(...normalizeParams(params))
+            .map((r) => normalizeRow(r)!)
+            .filter(Boolean) as T[],
+        run: (...params: unknown[]) => {
+          const info = stmt.run(...normalizeParams(params));
+          return {
+            changes: Number(info.changes),
+            lastInsertRowid: Number(info.lastInsertRowid),
+          };
+        },
+      };
+    },
+    transaction: <T>(fn: () => T) => rawDb.transaction(fn),
+  };
+}
+
+function tryNodeSqlite(dbFile: string): DbAdapter {
+  const { DatabaseSync } = require('node:sqlite') as {
+    DatabaseSync: new (filename: string) => {
+      exec: (sql: string) => void;
+      prepare: (sql: string) => {
+        get: (...args: unknown[]) => unknown;
+        all: (...args: unknown[]) => unknown[];
+        run: (...args: unknown[]) => { changes: number | bigint; lastInsertRowid: number | bigint };
+      };
+    };
+  };
+
+  const rawDb = new DatabaseSync(dbFile);
+  rawDb.prepare('SELECT 1').get();
+  let txDepth = 0;
+
+  return {
+    engine: 'node:sqlite',
+    dbPath: dbFile,
+    exec: (sql: string) => rawDb.exec(sql),
+    prepare: (sql: string) => {
+      const stmt = rawDb.prepare(sql);
+      return {
+        get: <T = Record<string, unknown>>(...params: unknown[]) =>
+          normalizeRow(stmt.get(...normalizeParams(params))) as T | undefined,
+        all: <T = Record<string, unknown>>(...params: unknown[]) =>
+          stmt
+            .all(...normalizeParams(params))
+            .map((r) => normalizeRow(r)!)
+            .filter(Boolean) as T[],
+        run: (...params: unknown[]) => {
+          const info = stmt.run(...normalizeParams(params));
+          return {
+            changes: Number(info.changes),
+            lastInsertRowid: Number(info.lastInsertRowid),
+          };
+        },
+      };
+    },
+    transaction: <T>(fn: () => T) => {
+      return () => {
+        const sp = `sp_${txDepth}`;
+        if (txDepth === 0) rawDb.exec('BEGIN IMMEDIATE');
+        else rawDb.exec(`SAVEPOINT ${sp}`);
+        txDepth++;
+        try {
+          const result = fn();
+          txDepth--;
+          if (txDepth === 0) rawDb.exec('COMMIT');
+          else rawDb.exec(`RELEASE SAVEPOINT ${sp}`);
+          return result;
+        } catch (err) {
+          txDepth--;
+          try {
+            if (txDepth === 0) rawDb.exec('ROLLBACK');
+            else rawDb.exec(`ROLLBACK TO SAVEPOINT ${sp}; RELEASE SAVEPOINT ${sp}`);
+          } catch {
+            // ignore rollback error
+          }
+          throw err;
+        }
+      };
+    },
+  };
+}
+
+function tryBunSqlite(dbFile: string): DbAdapter {
+  const { Database: BunDatabase } = require('bun:sqlite') as {
+    Database: new (filename: string) => {
+      exec: (sql: string) => void;
+      query: (sql: string) => {
+        get: (...args: unknown[]) => unknown;
+        all: (...args: unknown[]) => unknown[];
+        run: (...args: unknown[]) => { changes: number | bigint; lastInsertRowid: number | bigint };
+      };
+      transaction: <T>(fn: () => T) => () => T;
+    };
+  };
+
+  const rawDb = new BunDatabase(dbFile);
+  rawDb.query('SELECT 1').get();
+
+  return {
+    engine: 'bun:sqlite',
+    dbPath: dbFile,
+    exec: (sql: string) => rawDb.exec(sql),
+    prepare: (sql: string) => {
+      const stmt = rawDb.query(sql);
+      return {
+        get: <T = Record<string, unknown>>(...params: unknown[]) =>
+          normalizeRow(stmt.get(...normalizeParams(params))) as T | undefined,
+        all: <T = Record<string, unknown>>(...params: unknown[]) =>
+          stmt
+            .all(...normalizeParams(params))
+            .map((r) => normalizeRow(r)!)
+            .filter(Boolean) as T[],
+        run: (...params: unknown[]) => {
+          const info = stmt.run(...normalizeParams(params));
+          return {
+            changes: Number(info.changes),
+            lastInsertRowid: Number(info.lastInsertRowid),
+          };
+        },
+      };
+    },
+    transaction: <T>(fn: () => T) => rawDb.transaction(fn),
+  };
+}
+
+function openDatabase(): DbAdapter {
+  const errors: string[] = [];
+  for (const candidatePath of getCandidateDbPaths()) {
+    try {
+      ensureParentDir(candidatePath);
+    } catch (err) {
+      errors.push(`dir(${candidatePath}): ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+
+    for (const loader of [tryBetterSqlite3, tryNodeSqlite, tryBunSqlite]) {
+      try {
+        const adapter = loader(candidatePath);
+        adapter.exec('PRAGMA foreign_keys = ON;');
+        try {
+          adapter.exec('PRAGMA busy_timeout = 5000;');
+        } catch {
+          // ignore if unsupported
+        }
+        if (!IS_SERVERLESS && candidatePath !== ':memory:') {
+          try {
+            adapter.exec('PRAGMA journal_mode = WAL;');
+          } catch {
+            adapter.exec('PRAGMA journal_mode = DELETE;');
+          }
+        }
+        return adapter;
+      } catch (err) {
+        errors.push(
+          `${loader.name}(${candidatePath}): ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+  }
+
+  throw new Error(`Unable to initialize SQLite database: ${errors.join(' | ')}`);
+}
+
+export const db: DbAdapter = openDatabase();
+
+const SESSION_SECRET = crypto
+  .createHash('sha256')
+  .update(
+    process.env.SESSION_SECRET ||
+      process.env.VERCEL_PROJECT_ID ||
+      'aeterna_commerce_persistent_session_secret_v1'
+  )
+  .digest('hex');
 
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -54,18 +297,46 @@ export function verifyPassword(password: string, storedHash: string): boolean {
   return crypto.timingSafeEqual(derived, keyBuf);
 }
 
+export interface SessionUserInfo {
+  id: number;
+  name: string;
+  username: string;
+  email: string;
+  role: 'customer' | 'manager';
+  createdAt?: string;
+}
+
 export interface TokenPayload {
   userId: number;
   role: 'customer' | 'manager';
+  username?: string;
+  name?: string;
+  email?: string;
+  createdAt?: string;
   exp: number;
 }
 
-export function createSessionToken(userId: number, role: 'customer' | 'manager'): string {
-  const payload: TokenPayload = {
-    userId,
-    role,
-    exp: Date.now() + 1000 * 60 * 60 * 24 * 7, // 7 days
-  };
+export function createSessionToken(
+  userOrId: number | SessionUserInfo,
+  roleArg?: 'customer' | 'manager'
+): string {
+  const payload: TokenPayload =
+    typeof userOrId === 'number'
+      ? {
+          userId: userOrId,
+          role: roleArg || 'customer',
+          exp: Date.now() + 1000 * 60 * 60 * 24 * 7, // 7 days
+        }
+      : {
+          userId: userOrId.id,
+          role: userOrId.role,
+          username: userOrId.username,
+          name: userOrId.name,
+          email: userOrId.email,
+          createdAt: userOrId.createdAt,
+          exp: Date.now() + 1000 * 60 * 60 * 24 * 7, // 7 days
+        };
+
   const data = Buffer.from(JSON.stringify(payload)).toString('base64url');
   const sig = crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('base64url');
   return `${data}.${sig}`;
